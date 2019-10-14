@@ -1,0 +1,31 @@
+<configuration packagingData="true">
+  <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+    <filter class="ch.qos.logback.core.filter.EvaluatorFilter">
+      <evaluator class="ch.qos.logback.classic.boolex.JaninoEventEvaluator">
+        <expression>
+          if(throwableProxy != null) {
+            final String tMessage = throwableProxy.getMessage();
+            if (tMessage != null) {
+              return (tMessage.equals("Cannot send inbound command on disconnected stage") ||
+                      tMessage.equals("ReadBufferingStage received unhandled error command"));
+            } else {
+              return false;
+            }
+          } else {
+            return false;
+          }
+        </expression>
+      </evaluator>
+      <OnMatch>DENY</OnMatch>
+    </filter>
+    <encoder>
+      <pattern>%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
+    </encoder>
+  </appender>
+
+  <logger name="io.isomarcte" level="INFO" />
+
+  <root level="INFO">
+    <appender-ref ref="STDOUT" />
+  </root>
+</configuration>

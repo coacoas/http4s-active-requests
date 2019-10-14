@@ -38,7 +38,7 @@ object ActiveRequestMiddleware {
     onStart: F[Unit],
     onEnd: F[Unit],
     action: Request[F] => F[Either[Request[F], Response[F]]]
-  )(implicit F: Bracket[F, Throwable]
+  )(implicit F: Sync[F]
   ): HttpMiddleware[F] = {
 
     (service: Kleisli[OptionT[F, ?], Request[F], Response[F]]) =>

@@ -9,7 +9,6 @@ import fs2.concurrent._
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
-import java.util.Random
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import org.http4s._
@@ -21,7 +20,10 @@ import org.http4s.implicits._
 import org.http4s.server._
 import org.http4s.server.blaze._
 import scala.concurrent.ExecutionContext
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration._
+// import org.http4s.client.asynchttpclient.AsyncHttpClient
+import org.http4s.client.blaze.BlazeClientBuilder
+
 
 final class ActiveRequestMiddlewareItTest extends BaseTest {
   import ActiveRequestMiddlewareItTest._
@@ -30,12 +32,27 @@ final class ActiveRequestMiddlewareItTest extends BaseTest {
     val postBody: String = "K&R"
     testServer(ioTimer,
       Test[IO](
-        (uri: Uri) => IO.pure(Request(uri = uri, method = Method.POST, body = Stream.chunk[IO, Byte](Chunk.bytes(postBody.getBytes)), headers = Headers.of(headers.`Content-Type`(MediaType.text.plain)))),
-        (l: Long) => IO(l shouldBe 0L).void,
-        (l: Long) => IO(l shouldBe 1L).void,
-        (l: Long) => IO(l shouldBe 1L).void,
-        (l: Long) => IO(l shouldBe 0L).void,
-        (response: Response[IO]) => response.as[String].flatMap(s => IO(s shouldBe postBody).void)
+        request = (uri: Uri) => IO.pure(
+          Request(
+            uri = uri,
+            method = Method.POST,
+            body = Stream.emit(postBody)
+              .covary[IO]
+              .observe(_.evalMap(s => IO(println(s"Sending $s"))))
+              .through(text.utf8Encode),
+            headers = Headers.of(
+              headers.`Content-Type`(MediaType.text.plain),
+              headers.`Transfer-Encoding`(TransferCoding.chunked)
+            )
+          )
+        ),
+        beforeServerHasRecievedRequest = (l: Long) => IO(l shouldBe 0L).void,
+        whileServerIsProcessingRequest = (l: Long) => IO(l shouldBe 1L).void,
+        afterServerHasCompletedRequest = (l: Long) => IO(l shouldBe 1L).void,
+        activeRequestMiddlewareCompleted = (l: Long) => IO(l shouldBe 0L).void,
+        responseTest = (response: Response[IO]) => IO(println(s"Response: $response")) *>
+          response.body.through(text.utf8Decode).compile.string
+          .flatMap(s => IO(s shouldBe postBody).void)
       )
     )
   }
@@ -71,54 +88,43 @@ object ActiveRequestMiddlewareItTest {
       Executors.newCachedThreadPool()
     )
 
-  private[this] def testClient[F[_]: Async : ContextShift]: Stream[F, Client[F]] =
-    JavaNetClientBuilder.apply[F](this.blockingEC).stream
+  // private[this] def testClient[F[_]: Async : ContextShift]: Stream[F, Client[F]] =
+  //   JavaNetClientBuilder.apply[F](this.blockingEC).stream
+
+  private[this] def testClient[F[_]: ConcurrentEffect : ContextShift]: Stream[F, Client[F]] =
+    BlazeClientBuilder[F](this.blockingEC).stream
 
   // private[this] def testClient[F[_]: ConcurrentEffect : ContextShift]: Stream[F, Client[F]] =
-  //   BlazeClientBuilder[F](this.blockingEC).stream
+  //   AsyncHttpClient.stream()
 
-  private[this] def startingPort[F[_]](random: Random)(implicit F: Sync[F]): F[Int] =
-    F.delay(random.nextInt % 65536).flatMap((i: Int) =>
-      if (i <= 2000) {
-        startingPort(random)
-      } else {
-        F.pure(i)
-      }
-    )
+  private[this] def freePort[F[_]](implicit F: Sync[F]): F[Int] =
+    F.delay(new ServerSocket(0)).map(_.getLocalPort())
 
-  private[this] def freePort[F[_]](startingPort: Int, attempts: Int)(implicit F: Sync[F]): F[Int] =
-    if (startingPort < 0 || startingPort > 65535) {
-      F.raiseError(new RuntimeException(s"$startingPort is not a valid port. 0 <= p <= 65535"))
-    } else {
-      F.bracket(
-        F.delay(new ServerSocket(startingPort))
-      )(
-        Function.const(F.pure(startingPort))
-      )((s: ServerSocket) =>
-        F.delay(s.close)
-      ).handleErrorWith{(t: Throwable) =>
-        if (attempts < 1 || startingPort === 65535) {
-          F.raiseError(t)
-        } else {
-          freePort(startingPort + 1, attempts - 1)
-        }
-      }
-    }
-
-  private[this] def routes[F[_]: Sync](
+  private[this] def routes[F[_]](
     client: Client[F],
     uri: Uri
+  )(
+    implicit F: Concurrent[F]
   ): HttpRoutes[F] = {
     val dsl: Http4sDsl[F] = Http4sDsl[F]
     import dsl._
-    Http[F, F]{
+    HttpRoutes.of {
       case req @ POST -> Root =>
-        req.body.compile.toVector.flatMap{v =>
-          val s = new String(v.toArray)
-          val newRequest = req.removeHeader(headers.Host).withUri(uri).withEntity(Stream.chunk[F, Byte](Chunk.bytes(s.getBytes)))
-          Sync[F].delay(println(s"Strict body $s")) *> Sync[F].delay(println(newRequest)) *> client.toHttpApp.run(newRequest)
-        }
-    }.mapF(OptionT.liftF(_))
+        req
+          .bodyAsText
+          .observe(_.evalMap(s => F.delay(println(s"Recieved body: [$s]"))))
+          .compile
+          .foldMonoid
+          .flatMap { s  =>
+            val newRequest = req
+              .removeHeader(headers.Host)
+              .withUri(uri)
+              .withEntity(Stream(s).through(text.utf8Encode).covary[F])
+            (F.delay(println(s"Primary server: Strict body [$s]"))
+              *> F.delay(println(newRequest))
+              *> client.toHttpApp.run(newRequest))
+          }
+    }
   }
 
   private[this] def proxyRoutes[F[_]: Sync]: HttpRoutes[F] = {
@@ -126,8 +132,8 @@ object ActiveRequestMiddlewareItTest {
     import dsl._
     Http[F, F]{
       case req =>
-        Sync[F].delay(println(req)) *>
-        Ok().map(_.withEntity(req.body))
+        Sync[F].delay(println(s"Proxy route received request $req")) *>
+        Ok(req.body)
     }.mapF(OptionT.liftF(_))
   }
 
@@ -160,9 +166,7 @@ object ActiveRequestMiddlewareItTest {
   ): IO[Unit] = {
 
     val port: IO[Int] = for {
-      random <- IO(new Random(System.currentTimeMillis()))
-      sp <- this.startingPort[IO](random)
-      fp <- this.freePort[IO](sp, 10)
+      fp <- this.freePort[IO]// (sp, 10)
       _ <- IO(println(s"Port Selected For Test Server: $fp"))
     } yield fp
 
@@ -177,13 +181,13 @@ object ActiveRequestMiddlewareItTest {
         serverCompletedRequest <- Deferred[IO, Unit]
         activeRequestMiddlewareStarted <- Deferred[IO, Unit]
         activeRequestMiddlewareCompleted <- Deferred[IO, Unit]
-        uri <- IO(Uri.unsafeFromString(s"http://${this.testAddress.getHostName}:${p}/"))
-        uri2 <- IO(Uri.unsafeFromString(s"http://${this.testAddress.getHostName}:${p2}/"))
+        uri <- IO.fromEither(Uri.fromString(s"http://${this.testAddress.getHostName}:${p}/"))
+        uri2 <- IO.fromEither(Uri.fromString(s"http://${this.testAddress.getHostName}:${p2}/"))
         ref <- Ref.of[IO, ExitCode](ExitCode.Success)
         state <- Ref.of[IO, Long](0L)
         arm <- ActiveRequestMiddleware.serviceUnavailableMiddleware_(
           state.set _,
-          (l) => activeRequestMiddlewareStarted.get *> state.set(l) *> activeRequestMiddlewareCompleted.complete(()),
+          (l) => activeRequestMiddlewareStarted.get *> state.set(l) *> activeRequestMiddlewareCompleted.complete(()) *> IO(println(s"Finalized responsetest ($l)")),
           IO.unit,
           2
         )
@@ -204,35 +208,38 @@ object ActiveRequestMiddlewareItTest {
         val testF: Stream[IO, Unit] =
           this.testClient[IO].flatMap((client: Client[IO]) =>
             Stream.eval(for {
+              _ <- IO(println("Starting"))
               s0 <- state.get
+              _ <- IO(println(s"Initial state: $s0"))
               _ <- test.beforeServerHasRecievedRequest(s0)
               request <- test.request(uri)
+              _ <- IO(println(s"Sending $request"))
               fiber0 <- (IO.shift(this.blockingEC) *> client.fetch(request)(test.responseTest)).start
               _ <- serverHasRequest.get
-              _ <- IO(println("here"))
+              _ <- IO(println("Server has request"))
               s1 <- state.get
-              _ <- IO(println("here"))
+              _ <- IO(println(s"State is $s1"))
               _ <- test.whileServerIsProcessingRequest(s1)
-              _ <- IO(println("here"))
+              _ <- IO(println("Server is processing"))
               _ <- processTestComplete.complete(())
-              _ <- IO(println("here"))
+              _ <- IO(println("processTestComplete"))
               _ <- serverCompletedRequest.get
-              _ <- IO(println("here"))
+              _ <- IO(println("Server has completed request"))
               s2 <- state.get
-              _ <- IO(println("here"))
+              _ <- IO(println(s"State is now $s2"))
               _ <- test.afterServerHasCompletedRequest(s2)
-              _ <- IO(println("here"))
+              _ <- IO(println("Test passed"))
               _ <- activeRequestMiddlewareStarted.complete(())
-              _ <- IO(println("here"))
+              _ <- IO(println("Allow middleware to complete"))
               _ <- activeRequestMiddlewareCompleted.get
-              _ <- IO(println("here"))
+              _ <- IO(println("Middleware has completed"))
               s3 <- state.get
-              _ <- IO(println("here"))
+              _ <- IO(println(s"State is now $s3"))
               _ <- test.activeRequestMiddlewareCompleted(s3)
               _ <- IO(println("done"))
               result <- fiber0.join
-            } yield result
-            )
+              _ <- IO(println("Joined"))
+            } yield result)
           )
 
         val testStream: Stream[IO, Unit] =
